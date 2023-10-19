@@ -43,7 +43,62 @@
 -- |                 2. put a copy of the row in Problem B
 -- |         3. If the chosen column is an expandable type, recurse on Problem A
 -- |         4. Otherwise, guard against the chosen pattern, recursing on Problem A if it succeeds and recursing on Problem B if it fails.
-module PureScript.Backend.Optimizer.Convert where
+module PureScript.Backend.Optimizer.Convert
+  ( BackendBindingGroup
+  , BackendImplementations
+  , BackendModule
+  , CaseRow
+  , CaseRowGuardedExpr(..)
+  , ConvertEnv
+  , ConvertM
+  , DecomposeResult
+  , DecomposedCaseRow
+  , OptimizationSteps
+  , Pattern(..)
+  , PatternCase(..)
+  , SubPattern
+  , TopPattern
+  , WithDeps
+  , binderToPattern
+  , buildCaseLeaf
+  , buildCasePattern
+  , buildCaseTreeFromRows
+  , buildM
+  , chooseNextPattern
+  , currentLevel
+  , decompose
+  , fromExternImpl
+  , getCtx
+  , guardArrayLength
+  , guardBoolean
+  , guardChar
+  , guardInt
+  , guardNumber
+  , guardString
+  , guardTag
+  , intro
+  , levelUp
+  , make
+  , makeExternEvalRef
+  , makeExternEvalSpine
+  , makeGuard
+  , makeLet
+  , makeUncurriedAbs
+  , normalizeCaseRows
+  , patternFail
+  , patternPatCase
+  , patternSubterms
+  , patternVars
+  , toBackendBinding
+  , toBackendExpr
+  , toBackendModule
+  , toBackendTopLevelBindingGroup
+  , toBackendTopLevelBindingGroups
+  , toCaseRowVars
+  , toExternImpl
+  , toTopLevelBackendBinding
+  , topEnv
+  ) where
 
 import Prelude
 
@@ -52,7 +107,8 @@ import Control.Monad.RWS (ask)
 import Data.Array as Array
 import Data.Array.NonEmpty (NonEmptyArray)
 import Data.Array.NonEmpty as NonEmptyArray
-import Data.Foldable (foldMap, foldl)
+import Data.Filterable (filter)
+import Data.Foldable (findMap, foldMap, foldl)
 import Data.FoldableWithIndex (foldMapWithIndex, foldlWithIndex, foldrWithIndex)
 import Data.Function (on)
 import Data.FunctorWithIndex (mapWithIndex)
@@ -69,15 +125,17 @@ import Data.Set as Set
 import Data.Traversable (class Foldable, Accum, foldr, for, mapAccumL, mapAccumR, sequence, traverse)
 import Data.TraversableWithIndex (forWithIndex)
 import Data.Tuple (Tuple(..), fst, snd)
+import Debug (spy, spyWith)
 import Partial.Unsafe (unsafeCrashWith, unsafePartial)
 import PureScript.Backend.Optimizer.Analysis (BackendAnalysis)
 import PureScript.Backend.Optimizer.CoreFn (Ann(..), Bind(..), Binder(..), Binding(..), CaseAlternative(..), CaseGuard(..), Comment, ConstructorType(..), Expr(..), Guard(..), Ident(..), Literal(..), Meta(..), Module(..), ModuleName(..), ProperName, Qualified(..), ReExport, findProp, propKey, propValue, qualifiedModuleName, unQualified)
 import PureScript.Backend.Optimizer.Directives (DirectiveHeaderResult, parseDirectiveHeader)
-import PureScript.Backend.Optimizer.Semantics (BackendExpr(..), BackendSemantics, Ctx, DataTypeMeta, Env(..), EvalRef(..), ExternImpl(..), ExternSpine, InlineAccessor(..), InlineDirective(..), InlineDirectiveMap, NeutralExpr(..), build, evalExternFromImpl, evalExternRefFromImpl, freeze, optimize)
+import PureScript.Backend.Optimizer.Semantics (BackendExpr(..), BackendSemantics, Ctx, DataTypeMeta, DirectiveMap, Env(..), EvalRef(..), ExternImpl(..), ExternSpine, ImportDirective(..), InlineAccessor(..), InlineDirective(..), NeutralExpr(..), build, evalExternFromImpl, evalExternRefFromImpl, freeze, onInline, optimize)
 import PureScript.Backend.Optimizer.Semantics.Foreign (ForeignEval)
 import PureScript.Backend.Optimizer.Syntax (BackendAccessor(..), BackendOperator(..), BackendOperator1(..), BackendOperator2(..), BackendOperatorOrd(..), BackendSyntax(..), Level(..), Pair(..))
 import PureScript.Backend.Optimizer.Utils (foldl1Array)
 import Safe.Coerce (coerce)
+import Unsafe.Coerce (unsafeCoerce)
 
 type BackendBindingGroup a b =
   { recursive :: Boolean
@@ -96,7 +154,7 @@ type BackendModule =
   , reExports :: Set ReExport
   , foreign :: Set Ident
   , implementations :: BackendImplementations
-  , directives :: InlineDirectiveMap
+  , directives :: DirectiveMap
   }
 
 type ConvertEnv =
@@ -107,17 +165,20 @@ type ConvertEnv =
   , implementations :: BackendImplementations
   , moduleImplementations :: BackendImplementations
   , optimizationSteps :: OptimizationSteps
-  , directives :: InlineDirectiveMap
+  , directives :: DirectiveMap
   , foreignSemantics :: Map (Qualified Ident) ForeignEval
   , rewriteLimit :: Int
   , traceIdents :: Set (Qualified Ident)
+  , identsReplacedByDynamicImports :: Set (Qualified Ident)
   }
 
 type ConvertM = Function ConvertEnv
 
 toBackendModule :: Module Ann -> ConvertM (Tuple OptimizationSteps BackendModule)
-toBackendModule (Module mod) env = do
+toBackendModule (Module modExpanded) env = do
   let
+    mod = modExpanded { decls = collapseSyntheticBindingsInDynamicImports env modExpanded.decls }
+
     directives :: DirectiveHeaderResult
     directives = parseDirectiveHeader mod.name mod.comments
 
@@ -147,14 +208,29 @@ toBackendModule (Module mod) env = do
     moduleBindings = toBackendTopLevelBindingGroups mod.decls env
       { dataTypes = dataTypes
       , directives =
-          foldlWithIndex
-            ( \qual dirs dir ->
-                Map.alter (maybe (Just dir) Just) qual dirs
-            )
-            (Map.union directives.locals env.directives)
-            directives.exports
+          { inline: foldlWithIndex
+              ( \qual dirs dir ->
+                  Map.alter (maybe (Just dir) Just) qual dirs
+              )
+              (Map.union directives.locals.inline env.directives.inline)
+              directives.exports.inline
+          , imports: foldlWithIndex
+              ( \qual dirs dir ->
+                  Map.alter (maybe (Just dir) Just) qual dirs
+              )
+              (Map.union directives.locals.imports env.directives.imports)
+              directives.exports.imports
+          }
       , moduleImplementations = Map.empty
       }
+
+    moduleBindings' =
+      moduleBindings
+        { value = moduleBindings.value <#> \b -> b
+            { bindings = b.bindings # filter \(Tuple ident _) ->
+                not Set.member (Qualified (Just mod.name) ident) moduleBindings.accum.identsReplacedByDynamicImports
+            }
+        }
 
     localExports :: Set Ident
     localExports = Set.fromFoldable mod.exports
@@ -191,14 +267,14 @@ toBackendModule (Module mod) env = do
           }
       )
       Set.empty
-      moduleBindings.value
+      moduleBindings'.value
 
     usedImports :: Set ModuleName
     usedImports = usedBindings.accum # Set.mapMaybe \qi -> do
       mn <- qualifiedModuleName qi
       mn <$ guard (mn /= mod.name && mn /= ModuleName "Prim")
 
-  Tuple moduleBindings.accum.optimizationSteps $
+  Tuple moduleBindings'.accum.optimizationSteps $
     { name: mod.name
     , comments: mod.comments
     , imports: usedImports
@@ -206,14 +282,34 @@ toBackendModule (Module mod) env = do
     , bindings: usedBindings.value
     , exports: localExports
     , reExports: Set.fromFoldable mod.reExports
-    , implementations: moduleBindings.accum.moduleImplementations
+    , implementations: moduleBindings'.accum.moduleImplementations
     , directives: directives.exports
     , foreign: Set.fromFoldable mod.foreign
     }
+  where
+  isVal =
+    unwrap (env).currentModule == "Snapshot.DynamicImportTypeClassConcrete"
+
+  -- && (unwrap ident) == "addPreLazy"
+
+  spy_ :: forall a. String -> a -> a
+  spy_ s a =
+    if isVal then spy s a
+    else a
+
+  spyWith_ :: forall a b. String -> (a -> b) -> a -> a
+  spyWith_ s f a =
+    if isVal then spyWith s f a
+    else a
+
+collapseSyntheticBindingsInDynamicImports :: ConvertEnv -> Array (Bind Ann) -> Array (Bind Ann)
+collapseSyntheticBindingsInDynamicImports env bindings = bindings
 
 type WithDeps = Tuple (Set (Qualified Ident))
 
-toBackendTopLevelBindingGroups :: Array (Bind Ann) -> ConvertM (Accum ConvertEnv (Array (BackendBindingGroup Ident (WithDeps NeutralExpr))))
+toBackendTopLevelBindingGroups
+  :: Array (Bind Ann)
+  -> ConvertM (Accum ConvertEnv (Array (BackendBindingGroup Ident (WithDeps NeutralExpr))))
 toBackendTopLevelBindingGroups binds env = do
   let result = mapAccumL toBackendTopLevelBindingGroup env binds
   result
@@ -249,6 +345,7 @@ toTopLevelBackendBinding group env (Binding _ ident cfn) = do
   let enableTracing = Set.member qualifiedIdent env.traceIdents
   let Tuple mbSteps optimizedExpr = optimize enableTracing (getCtx env) evalEnv qualifiedIdent env.rewriteLimit backendExpr
   let Tuple impl expr' = toExternImpl env group optimizedExpr
+  let Tuple replaced expr'' = replaceDynamicImports expr'
   { accum: env
       { implementations = Map.insert qualifiedIdent impl env.implementations
       , moduleImplementations = Map.insert qualifiedIdent impl env.moduleImplementations
@@ -256,22 +353,81 @@ toTopLevelBackendBinding group env (Binding _ ident cfn) = do
       , directives =
           case inferTransitiveDirective env.directives (snd impl) backendExpr cfn of
             Just dirs ->
-              Map.alter
-                case _ of
-                  Just oldDirs ->
-                    Just $ Map.union oldDirs dirs
-                  Nothing ->
-                    Just dirs
-                (EvalExtern (Qualified (Just env.currentModule) ident))
+              onInline
+                ( Map.alter
+                    case _ of
+                      Just oldDirs ->
+                        Just $ Map.union oldDirs dirs
+                      Nothing ->
+                        Just dirs
+                    (EvalExtern (Qualified (Just env.currentModule) ident))
+                )
                 env.directives
             Nothing ->
               env.directives
+      , identsReplacedByDynamicImports = replaced <> env.identsReplacedByDynamicImports
       }
-  , value: Tuple ident (Tuple (unwrap (fst impl)).deps expr')
+  , value: Tuple ident
+      ( Tuple (unwrap (fst impl)).deps
+          $ expr''
+      )
   }
+  where
+  isVal =
+    unwrap (env).currentModule == "Snapshot.DynamicImportTypeClassConcrete"
+      && (unwrap ident) == "addPreLazy"
 
-inferTransitiveDirective :: InlineDirectiveMap -> ExternImpl -> BackendExpr -> Expr Ann -> Maybe (Map InlineAccessor InlineDirective)
-inferTransitiveDirective directives impl backendExpr cfn = fromImpl <|> fromBackendExpr
+  spy_ :: forall a. String -> a -> a
+  spy_ s a =
+    if isVal then spy s a
+    else a
+
+  replaceDynamicImports :: NeutralExpr -> Tuple (Set (Qualified Ident)) NeutralExpr
+  replaceDynamicImports = case _ of
+    NeutralExpr (App (NeutralExpr (Var qIdent)) b)
+      | Just DynamicImportDir <- getExprDir env qIdent
+      , Just { moduleName, exprIdent } <- getBodyIdentQualified b ->
+          let
+            Tuple removed b' = expandLocalVars b
+          in
+            Tuple removed $ NeutralExpr $ DynamicImport moduleName exprIdent $ b'
+
+    NeutralExpr expr -> coerce $ traverse replaceDynamicImports expr
+
+  getExprDir :: ConvertEnv -> Qualified Ident -> (Maybe ImportDirective)
+  getExprDir { directives: { imports } } id =
+    Map.lookup (EvalExtern id) imports >>= Map.lookup InlineRef
+
+  getBodyIdentQualified :: forall f. Foldable f => f NeutralExpr -> Maybe { moduleName :: ModuleName, exprIdent :: Ident }
+  getBodyIdentQualified ns = findMap getIdentQualified ns
+
+  getIdentQualified :: NeutralExpr -> Maybe { moduleName :: ModuleName, exprIdent :: Ident }
+  getIdentQualified ne = case unwrap ne of
+    Var qual@(Qualified (Just moduleName) exprIdent) ->
+      if moduleName == env.currentModule then
+        lookupExpr qual >>= getIdentQualified
+      else
+        Just { moduleName, exprIdent }
+    expr -> findMap getIdentQualified expr
+
+  expandLocalVars :: NonEmptyArray NeutralExpr -> Tuple (Set (Qualified Ident)) (NonEmptyArray NeutralExpr)
+  expandLocalVars ns = traverse expandLocalVar ns
+
+  expandLocalVar :: NeutralExpr -> Tuple (Set (Qualified Ident)) NeutralExpr
+  expandLocalVar (NeutralExpr expr) = case expr of
+    Var qual@(Qualified (Just moduleName) _)
+      | moduleName == env.currentModule
+      , Just foundExpr <- lookupExpr qual -> Tuple (Set.singleton qual) foundExpr
+    _ ->
+      coerce $ traverse expandLocalVar expr
+
+  lookupExpr :: Qualified Ident -> Maybe NeutralExpr
+  lookupExpr qual = Map.lookup qual env.moduleImplementations >>= \(Tuple _ impl) -> case impl of
+    ExternExpr _ ne' -> Just ne'
+    _ -> Nothing
+
+inferTransitiveDirective :: DirectiveMap -> ExternImpl -> BackendExpr -> Expr Ann -> Maybe (Map InlineAccessor InlineDirective)
+inferTransitiveDirective { inline: directives } impl backendExpr cfn = fromImpl <|> fromBackendExpr
   where
   fromImpl = case impl of
     ExternExpr _ (NeutralExpr (App (NeutralExpr (Var qual)) args)) ->
@@ -359,8 +515,11 @@ buildM a env = build (getCtx env) a
 getCtx :: ConvertEnv -> Ctx
 getCtx env =
   { currentLevel: env.currentLevel
+  , currentModule: env.currentModule
   , lookupExtern
   , effect: false
+  , inDynamicImport: false
+  , isDynamicImport: \ident -> Map.lookup (EvalExtern ident) env.directives.imports >>= Map.lookup InlineRef # eq (Just DynamicImportDir)
   }
   where
   lookupExtern (Tuple qual acc) = do
@@ -404,70 +563,72 @@ currentLevel :: ConvertM Level
 currentLevel env = Level env.currentLevel
 
 toBackendExpr :: Expr Ann -> ConvertM BackendExpr
-toBackendExpr = case _ of
-  ExprVar _ qi -> do
-    { currentModule, toLevel } <- ask
-    case qi of
-      Qualified Nothing ident | Just lvl <- Map.lookup ident toLevel ->
-        buildM (Local (Just ident) lvl)
-      Qualified (Just mn) ident | mn == currentModule, Just lvl <- Map.lookup ident toLevel ->
-        buildM (Local (Just ident) lvl)
-      Qualified (Just (ModuleName "Prim")) (Ident "undefined") ->
-        buildM PrimUndefined
-      Qualified Nothing ident ->
-        buildM (Var (Qualified (Just currentModule) ident))
-      _ ->
-        buildM (Var qi)
-  ExprLit _ lit ->
-    buildM <<< Lit =<< traverse toBackendExpr lit
-  ExprConstructor _ ty name fields -> do
-    { dataTypes } <- ask
-    let
-      ct = case Map.lookup ty dataTypes of
-        Just { constructors } | Map.size constructors == 1 -> ProductType
-        _ -> SumType
-    buildM (CtorDef ct ty name fields)
-  ExprAccessor _ a field ->
-    buildM <<< flip Accessor (GetProp field) =<< toBackendExpr a
-  ExprUpdate _ a bs ->
-    join $ (\x y -> buildM (Update x y))
-      <$> toBackendExpr a
-      <*> traverse (traverse toBackendExpr) bs
-  ExprAbs _ arg body -> do
-    lvl <- currentLevel
-    make $ Abs (NonEmptyArray.singleton (Tuple (Just arg) lvl)) (intro [ arg ] lvl (toBackendExpr body))
-  ExprApp _ a b
-    | ExprVar (Ann { meta: Just IsNewtype }) id <- a -> do
-        toBackendExpr b
-    | otherwise ->
-        make $ App (toBackendExpr a) (NonEmptyArray.singleton (toBackendExpr b))
-  ExprLet _ binds body ->
-    foldr go (toBackendExpr body) binds
-    where
-    go bind' next = case bind' of
-      NonRec (Binding _ ident expr) ->
-        makeLet (Just ident) (toBackendExpr expr) \_ -> next
-      Rec bindings | Just bindings' <- NonEmptyArray.fromArray bindings -> do
-        lvl <- currentLevel
-        let idents = (\(Binding _ ident _) -> ident) <$> bindings'
-        join $ (\x y -> buildM (LetRec lvl x y))
-          <$> intro idents lvl (traverse toBackendBinding bindings')
-          <*> intro idents lvl next
-      Rec _ ->
-        unsafeCrashWith "CoreFn empty Rec binding group"
-  ExprCase _ exprs alts ->
-    foldr
-      ( \expr next idents ->
-          makeLet Nothing (toBackendExpr expr) \tmp ->
-            next (Array.snoc idents tmp)
-      )
-      ( \idents ->
-          toInitialCaseRows idents alts \caseRows ->
-            buildCaseTreeFromRows caseRows
-      )
-      exprs
-      []
+toBackendExpr =
+  case _ of
+    ExprVar _ qi -> do
+      { currentModule, toLevel } <- ask
+      case qi of
+        Qualified Nothing ident | Just lvl <- Map.lookup ident toLevel ->
+          buildM (Local (Just ident) lvl)
+        Qualified (Just mn) ident | mn == currentModule, Just lvl <- Map.lookup ident toLevel ->
+          buildM (Local (Just ident) lvl)
+        Qualified (Just (ModuleName "Prim")) (Ident "undefined") ->
+          buildM PrimUndefined
+        Qualified Nothing ident ->
+          buildM (Var (Qualified (Just currentModule) ident))
+        _ ->
+          buildM (Var qi)
+    ExprLit _ lit ->
+      buildM <<< Lit =<< traverse toBackendExpr lit
+    ExprConstructor _ ty name fields -> do
+      { dataTypes } <- ask
+      let
+        ct = case Map.lookup ty dataTypes of
+          Just { constructors } | Map.size constructors == 1 -> ProductType
+          _ -> SumType
+      buildM (CtorDef ct ty name fields)
+    ExprAccessor _ a field ->
+      buildM <<< flip Accessor (GetProp field) =<< toBackendExpr a
+    ExprUpdate _ a bs ->
+      join $ (\x y -> buildM (Update x y))
+        <$> toBackendExpr a
+        <*> traverse (traverse toBackendExpr) bs
+    ExprAbs _ arg body -> do
+      lvl <- currentLevel
+      make $ Abs (NonEmptyArray.singleton (Tuple (Just arg) lvl)) (intro [ arg ] lvl (toBackendExpr body))
+    ExprApp _ a b
+      | ExprVar (Ann { meta: Just IsNewtype }) id <- a -> do
+          toBackendExpr b
+      | otherwise -> do
+          make $ App (toBackendExpr a) (NonEmptyArray.singleton (toBackendExpr b))
+    ExprLet _ binds body ->
+      foldr go (toBackendExpr body) binds
+      where
+      go bind' next = case bind' of
+        NonRec (Binding _ ident expr) ->
+          makeLet (Just ident) (toBackendExpr expr) \_ -> next
+        Rec bindings | Just bindings' <- NonEmptyArray.fromArray bindings -> do
+          lvl <- currentLevel
+          let idents = (\(Binding _ ident _) -> ident) <$> bindings'
+          join $ (\x y -> buildM (LetRec lvl x y))
+            <$> intro idents lvl (traverse toBackendBinding bindings')
+            <*> intro idents lvl next
+        Rec _ ->
+          unsafeCrashWith "CoreFn empty Rec binding group"
+    ExprCase _ exprs alts ->
+      foldr
+        ( \expr next idents ->
+            makeLet Nothing (toBackendExpr expr) \tmp ->
+              next (Array.snoc idents tmp)
+        )
+        ( \idents ->
+            toInitialCaseRows idents alts \caseRows ->
+              buildCaseTreeFromRows caseRows
+        )
+        exprs
+        []
   where
+
   toInitialCaseRows :: Array Level -> Array (CaseAlternative Ann) -> (Array CaseRow -> ConvertM BackendExpr) -> ConvertM BackendExpr
   toInitialCaseRows idents alts useCaseRowsCb =
     foldr

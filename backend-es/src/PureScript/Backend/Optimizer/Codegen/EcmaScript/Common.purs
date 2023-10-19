@@ -14,7 +14,9 @@ module PureScript.Backend.Optimizer.Codegen.EcmaScript.Common
   , esNumber
   , esString
   , esTernary
-  ) where
+  , esThunk
+  )
+  where
 
 import Prelude
 
@@ -23,6 +25,7 @@ import Data.Array (fold)
 import Data.Array as Array
 import Data.Enum (fromEnum)
 import Data.Maybe (Maybe(..))
+import Data.Newtype (unwrap)
 import Data.Set (Set)
 import Data.Set as Set
 import Data.String as String
@@ -223,6 +226,18 @@ esApp a bs =
     a <> Dodo.Common.jsParens args
   where
   args = Dodo.foldWithSeparator Dodo.Common.trailingComma bs
+
+-- Dodo.text "import("
+-- <> Dodo.text (esEscapeString (runModuleName mName))
+-- <> Dodo.text ")"
+-- <> Dodo.text ".then(("
+-- <> Dodo.text (esEscapeIdent (runModuleName mName))
+-- <> Dodo.text ") => "
+-- <> body
+-- <> Dodo.text ")"
+
+esThunk :: forall a. Dodo.Doc a -> Dodo.Doc a
+esThunk a = Dodo.text "(() => " <> a <> Dodo.text ")"
 
 esComment :: forall a. Comment -> Dodo.Doc a
 esComment = case _ of

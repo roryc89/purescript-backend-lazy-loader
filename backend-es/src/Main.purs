@@ -42,6 +42,7 @@ import PureScript.Backend.Optimizer.Codegen.EcmaScript (codegenModule, esModuleP
 import PureScript.Backend.Optimizer.Codegen.EcmaScript.Builder (basicBuildMain, externalDirectivesFromFile)
 import PureScript.Backend.Optimizer.Codegen.EcmaScript.Foreign (esForeignSemantics)
 import PureScript.Backend.Optimizer.CoreFn (Ident(..), Module(..), ModuleName(..), Qualified(..))
+import PureScript.Backend.Optimizer.Semantics (emptyDirectiveMap)
 import PureScript.Backend.Optimizer.Semantics.Foreign (coreForeignSemantics)
 import PureScript.Backend.Optimizer.Tracer.Printer (printModuleSteps)
 import PureScript.CST.Lexer (lexToken)
@@ -58,6 +59,8 @@ type BuildArgs =
   , directivesFile :: Maybe FilePath
   , intTags :: Boolean
   , traceIdents :: Set (Qualified Ident)
+  , dynamicImportModule :: Maybe String
+  , dynamicImportValue :: Maybe String
   }
 
 buildArgsParser :: ArgParser BuildArgs
@@ -99,6 +102,15 @@ buildArgsParser =
                       Left $ "Unable to parse qualified name: " <> str
               )
           # ArgParser.folded
+
+    , dynamicImportModule:
+        ArgParser.argument [ "--foreign-dir" ]
+          "Path to directory for foreign module overrides (optional)."
+          # ArgParser.optional
+    , dynamicImportValue:
+        ArgParser.argument [ "--foreign-dir" ]
+          "Path to directory for foreign module overrides (optional)."
+          # ArgParser.optional
     }
 
 data TargetPlatform = Browser | Node
@@ -213,7 +225,7 @@ main cliRoot =
   buildCmd :: BuildArgs -> Aff Unit
   buildCmd args = liftEffect (Ref.new []) >>= \stepsRef -> basicBuildMain
     { resolveCoreFnDirectory: pure args.coreFnDir
-    , resolveExternalDirectives: map (fromMaybe Map.empty) $ traverse externalDirectivesFromFile args.directivesFile
+    , resolveExternalDirectives: map (fromMaybe emptyDirectiveMap) $ traverse externalDirectivesFromFile args.directivesFile
     , foreignSemantics: Map.union coreForeignSemantics esForeignSemantics
     , onCodegenBefore: do
         mkdirp args.outputDir
@@ -225,7 +237,13 @@ main cliRoot =
           let allDoc = Dodo.foldWithSeparator (Dodo.break <> Dodo.break) $ uncurry printModuleSteps <$> allSteps
           FS.writeTextFile UTF8 "optimization-traces.txt" $ Dodo.print Dodo.plainText Dodo.twoSpaces allDoc
     , onCodegenModule: \build (Module coreFnMod) backendMod@{ name: ModuleName name } optimizationSteps -> do
-        let formatted = Dodo.print Dodo.plainText (Dodo.twoSpaces { pageWidth = 180, ribbonRatio = 1.0 }) $ codegenModule { intTags: args.intTags } build.implementations backendMod
+        let
+          formatted = Dodo.print Dodo.plainText (Dodo.twoSpaces { pageWidth = 180, ribbonRatio = 1.0 })
+            $ codegenModule
+                { intTags: args.intTags
+                }
+                build.implementations
+                backendMod
         let modPath = Path.concat [ args.outputDir, name ]
         mkdirp modPath
         writeTextFile UTF8 (Path.concat [ modPath, "index.js" ]) formatted

@@ -108,6 +108,7 @@ decodeModule' decodeAnn' json = do
   exports <- getField (decodeArray decodeIdent) obj "exports"
   reExports <- getField decodeReExports obj "reExports"
   decls <- getField (decodeArray (decodeBind (decodeAnn' path))) obj "decls"
+
   foreign_ <- getField (decodeArray decodeIdent) obj "foreign"
   comments <- getField (decodeArray decodeComment) obj "comments"
   pure $ Module

@@ -14,12 +14,13 @@ import Data.Foldable (foldl, for_)
 import Data.Lazy as Lazy
 import Data.List (List)
 import Data.Map (Map)
-import Data.Map as Map
 import Data.Maybe (maybe)
+import Data.Newtype (unwrap)
 import Data.Set (Set)
 import Data.Set as Set
 import Data.Set.NonEmpty as NonEmptySet
 import Data.Tuple (Tuple(..))
+import Debug (spy)
 import Effect.Aff (Aff, parallel, sequential)
 import Effect.Class (liftEffect)
 import Effect.Class.Console as Console
@@ -30,12 +31,12 @@ import Node.Path (FilePath)
 import Node.Process as Process
 import PureScript.Backend.Optimizer.Builder (BuildEnv, buildModules)
 import PureScript.Backend.Optimizer.Convert (BackendModule, OptimizationSteps)
-import PureScript.Backend.Optimizer.CoreFn (Ann, Ident, Module, ModuleName(..), Qualified)
+import PureScript.Backend.Optimizer.CoreFn (Ann, Ident, Module(..), ModuleName(..), Qualified)
 import PureScript.Backend.Optimizer.CoreFn.Json (decodeModule)
 import PureScript.Backend.Optimizer.CoreFn.Sort (emptyPull, pullResult, resumePull, sortModules)
 import PureScript.Backend.Optimizer.Directives (parseDirectiveFile)
 import PureScript.Backend.Optimizer.Directives.Defaults as Defaults
-import PureScript.Backend.Optimizer.Semantics (InlineDirectiveMap)
+import PureScript.Backend.Optimizer.Semantics (DirectiveMap, mergeDirectiveMaps)
 import PureScript.Backend.Optimizer.Semantics.Foreign (ForeignEval)
 import PureScript.CST.Errors (printParseError)
 
@@ -70,7 +71,7 @@ readCoreFnModule filePath = do
     Right mod ->
       pure $ Right mod
 
-externalDirectivesFromFile :: FilePath -> Aff InlineDirectiveMap
+externalDirectivesFromFile :: FilePath -> Aff DirectiveMap
 externalDirectivesFromFile filePath = do
   fileContent <- FS.readTextFile UTF8 filePath
   let { errors, directives } = parseDirectiveFile fileContent
@@ -82,7 +83,7 @@ externalDirectivesFromFile filePath = do
 
 basicBuildMain
   :: { resolveCoreFnDirectory :: Aff FilePath
-     , resolveExternalDirectives :: Aff InlineDirectiveMap
+     , resolveExternalDirectives :: Aff DirectiveMap
      , foreignSemantics :: Map (Qualified Ident) ForeignEval
      , onCodegenBefore :: Aff Unit
      , onCodegenAfter :: Aff Unit
@@ -97,7 +98,8 @@ basicBuildMain options = do
       <$> parallel options.resolveCoreFnDirectory
       <*> parallel options.resolveExternalDirectives
   let defaultDirectives = (parseDirectiveFile Defaults.defaultDirectives).directives
-  let allDirectives = Map.union externalDirectives defaultDirectives
+  let allDirectives = mergeDirectiveMaps externalDirectives defaultDirectives
+
   coreFnModulesFromOutput coreFnDir (pure "**") >>= case _ of
     Left errors -> do
       for_ errors \(Tuple filePath err) -> do
